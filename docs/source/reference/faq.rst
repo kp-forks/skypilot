@@ -1,18 +1,20 @@
 .. _sky-faq:
 
 Frequently Asked Questions
-------------------------------------------------
+==========================
 
 
 .. contents::
     :local:
-    :depth: 1
+    :depth: 2
 
+Git and GitHub
+--------------
 
-Can I clone private GitHub repositories in a task's ``setup`` commands?
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+How to clone private GitHub repositories in a task's ``setup`` commands?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Yes, provided you have `set up SSH agent forwarding <https://docs.github.com/en/developers/overview/using-ssh-agent-forwarding>`_.
+This is possible provided you have `set up SSH agent forwarding <https://docs.github.com/en/developers/overview/using-ssh-agent-forwarding>`_.
 For example, run the following on your laptop:
 
 .. code-block:: bash
@@ -29,6 +31,38 @@ Then, any SkyPilot clusters launched from this machine would be able to clone pr
       git clone git@github.com:your-proj/your-repo.git
 
 Note: currently, cloning private repositories in the ``run`` commands is not supported yet.
+
+How to ensure my workdir's ``.git`` is synced up for managed spot jobs?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Currently, there is a difference in whether ``.git`` is synced up depending on the command used:
+
+- For regular ``sky launch``, the workdir's ``.git`` is synced up by default.
+- For managed jobs ``sky jobs launch``, the workdir's ``.git`` is excluded by default.
+
+In the second case, to ensure the workdir's ``.git`` is synced up for managed spot jobs, you can explicitly add a file mount to sync it up:
+
+.. code-block:: yaml
+
+  workdir: .
+  file_mounts:
+    ~/sky_workdir/.git: .git
+
+This can be useful if your jobs use certain experiment tracking tools that depend on the ``.git`` directory to track code changes.
+
+File mounting (``file_mounts``)
+-------------------------------
+
+How to make SkyPilot clusters use my Weights & Biases credentials?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Install the wandb library on your laptop and login to your account via ``wandb login``.
+Then, add the following lines in your task yaml file:
+
+.. code-block:: yaml
+
+  file_mounts:
+    ~/.netrc: ~/.netrc
 
 How to mount additional files into a cloned repository?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -56,18 +90,6 @@ To get around this, mount the files to a different path, then symlink to them.  
     ln -s /tmp/tmp.txt ~/code-repo/
 
 
-
-How to make SkyPilot clusters use my Weights & Biases credentials?
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-Install the wandb library on your laptop and login to your account via ``wandb login``.
-Then, add the following lines in your task yaml file:
-
-.. code-block:: yaml
-
-  file_mounts:
-    ~/.netrc: ~/.netrc
-
 How to update an existing cluster's ``file_mounts`` without rerunning ``setup``?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -76,28 +98,43 @@ If you have edited the ``file_mounts`` section (e.g., by adding some files) and 
 To avoid rerunning the ``setup`` commands, pass the ``--no-setup`` flag to ``sky launch``.
 
 
-What are the required IAM permissons on GCP for SkyPilot?
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Region settings
+---------------
 
-To use SkyPilot, your GCP account needs to be granted the following IAM roles:
+How to launch VMs in a subset of regions only (e.g., Europe only)?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-.. code-block:: yaml
+When defining a task, you can use the ``resources.any_of`` field to specify a set of regions you want to launch VMs in.
 
-  roles/browser
-  roles/compute.admin
-  roles/iam.serviceAccountAdmin
-  roles/iam.serviceAccountUser
-  roles/serviceusage.serviceUsageConsumer
-  roles/storage.admin
-
-Optionally, to use TPUs, add the following role:
+For example, to launch VMs in Europe only (which can help with GDPR compliance), you can use the following task definition:
 
 .. code-block:: yaml
 
-  roles/tpu.admin
+  resources:
+    # SkyPilot will perform cost optimization among the specified regions.
+    any_of:
+      # AWS:
+      - region: eu-central-1
+      - region: eu-west-1
+      - region: eu-west-2
+      - region: eu-west-3
+      - region: eu-north-1
+      # GCP:
+      - region: europe-central2
+      - region: europe-north1
+      - region: europe-southwest1
+      - region: europe-west1
+      - region: europe-west10
+      - region: europe-west12
+      - region: europe-west2
+      - region: europe-west3
+      - region: europe-west4
+      - region: europe-west6
+      - region: europe-west8
+      - region: europe-west9
+      # Or put in other clouds' Europe regions.
 
-You can grant those accesses via the `GCP IAM console <https://console.cloud.google.com/iam-admin/iam>`_.
-
+See more details about the ``resources.any_of`` field :ref:`here <multiple-resources>`.
 
 (Advanced) How to make SkyPilot use all global regions?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -109,14 +146,32 @@ By default, SkyPilot supports most global regions on AWS and only supports the U
   version=$(python -c 'import sky; print(sky.clouds.service_catalog.constants.CATALOG_SCHEMA_VERSION)')
   mkdir -p ~/.sky/catalogs/${version}
   cd ~/.sky/catalogs/${version}
-  # Fetch all regions for GCP
+  # GCP
   pip install lxml
+  # Fetch U.S. regions for GCP
+  python -m sky.clouds.service_catalog.data_fetchers.fetch_gcp
+  # Fetch the specified zones for GCP
+  python -m sky.clouds.service_catalog.data_fetchers.fetch_gcp --zones northamerica-northeast1-a us-east1-b us-east1-c
+  # Fetch U.S. zones for GCP, excluding the specified zones
+  python -m sky.clouds.service_catalog.data_fetchers.fetch_gcp --exclude us-east1-a us-east1-b
+  # Fetch all regions for GCP
   python -m sky.clouds.service_catalog.data_fetchers.fetch_gcp --all-regions
-  
+  # Run in single-threaded mode. This is useful when multiple processes don't work well with the GCP client due to SSL issues.
+  python -m sky.clouds.service_catalog.data_fetchers.fetch_gcp --single-threaded
+
+  # Azure
+  # Fetch U.S. regions for Azure
+  python -m sky.clouds.service_catalog.data_fetchers.fetch_azure
   # Fetch all regions for Azure
   python -m sky.clouds.service_catalog.data_fetchers.fetch_azure --all-regions
+  # Run in single-threaded mode. This is useful when multiple processes don't work well with the Azure client due to SSL issues.
+  python -m sky.clouds.service_catalog.data_fetchers.fetch_azure --single-threaded
+  # Fetch the specified regions for Azure
+  python -m sky.clouds.service_catalog.data_fetchers.fetch_azure --regions japaneast australiaeast uksouth
+  # Fetch U.S. regions for Azure, excluding the specified regions
+  python -m sky.clouds.service_catalog.data_fetchers.fetch_azure --exclude centralus eastus
 
-To make your managed spot jobs potentially use all global regions, please log into the spot controller with ``ssh sky-spot-controller-<hash>`` 
+To make your managed spot jobs potentially use all global regions, please log into the spot controller with ``ssh sky-spot-controller-<hash>``
 (the full name can be found in ``sky status``), and run the commands above.
 
 
@@ -136,3 +191,41 @@ You can customize the catalog files to your needs.
 For example, if you have access to special regions of GCP, add the data to ``~/.sky/catalogs/<schema-version>/gcp.csv``.
 Also, you can update the catalog for a specific cloud by deleting the CSV file (e.g., ``rm ~/.sky/catalogs/<schema-version>/gcp.csv``).
 SkyPilot will automatically download the latest catalog in the next run.
+
+Package Installation
+---------------------
+
+Unable to import PyTorch in a SkyPilot task.
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+For `PyTorch <https://pytorch.org/>`_ installation, if you are using the default SkyPilot images (not passing in `--image-id`), ``pip install torch`` should work.
+
+But if you use your own image which has an older NVIDIA driver (535.161.08 or lower) and you install the default PyTorch, you may encounter the following error:
+
+.. code-block:: bash
+
+  ImportError: /home/azureuser/miniconda3/lib/python3.10/site-packages/torch/lib/../../nvidia/cusparse/lib/libcusparse.so.12: undefined symbol: __nvJitLinkComplete_12_4, version libnvJitLink.so.12
+
+You will need to install a PyTorch version that is compatible with your NVIDIA driver, e.g., ``pip install torch --index-url https://download.pytorch.org/whl/cu121``.
+
+
+Miscellaneous
+-------------
+
+How can I launch a VS Code tunnel using a SkyPilot task definition?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+To launch a VS Code tunnel using a SkyPilot task definition, you can use the following task definition:
+
+.. code-block:: yaml
+
+    setup: |
+      sudo snap install --classic code
+      # if `snap` is not available, you can try the following commands instead:
+      # wget https://go.microsoft.com/fwlink/?LinkID=760868 -O vscode.deb
+      # sudo apt install ./vscode.deb -y
+      # rm vscode.deb
+    run: |
+      code tunnel --accept-server-license-terms
+
+Note that you'll be prompted to authenticate with your GitHub account to launch a VS Code tunnel.
+

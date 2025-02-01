@@ -4,7 +4,7 @@
     <img src="https://i.imgur.com/z3AOYLV.png" alt="Vicuna LLM"/>
 </p>
 
-This README contains instructions to run and train Vicuna, an open-source LLM chatbot with quality comparable to ChatGPT. The Vicuna release was trained using SkyPilot on [cloud spot instances](https://skypilot.readthedocs.io/en/latest/examples/spot-jobs.html), with a cost of ~$300.
+This README contains instructions to run and train Vicuna, an open-source LLM chatbot with quality comparable to ChatGPT. The Vicuna release was trained using SkyPilot on [cloud spot instances](https://docs.skypilot.co/en/latest/examples/spot-jobs.html), with a cost of ~$300.
 
 * [Blog post](https://lmsys.org/blog/2023-03-30-vicuna/)
 * [Demo](https://chat.lmsys.org/)
@@ -20,7 +20,7 @@ See the Vicuna SkyPilot YAMLs: for [training](train.yaml) and for [serving](serv
 
 ## Serve the official Vicuna model by yourself with SkyPilot
 
-1. Start the serving the Vicuna-7B model on a single A100 GPU:
+1. Start serving the Vicuna-7B model on a single A100 GPU:
 ```bash
 sky launch -c vicuna-serve -s serve.yaml
 ```
@@ -41,6 +41,11 @@ sky launch -c vicuna-serve-v100 -s serve.yaml --gpus V100
 sky launch -c vicuna-serve -s serve.yaml --env MODEL_SIZE=13
 ```
 
+5. [Optional] Serve the OpenAI API Compatible Endpoint:
+```bash
+sky launch -c vicuna-openai-api -s serve-openai-api-endpoint.yaml
+```
+
 
 ## Training Vicuna with SkyPilot
 Currently, training requires GPUs with 80GB memory.  See `sky show-gpus --all` for supported GPUs.
@@ -58,14 +63,14 @@ Steps for training on your cloud(s):
 2. **Training the Vicuna-7B model on 8 A100 GPUs (80GB memory) using spot instances**:
 ```bash
 # Launch it on managed spot to save 3x cost
-sky spot launch -n vicuna train.yaml
+sky jobs launch -n vicuna train.yaml
 ```
 Note: if you would like to see the training curve on W&B, you can add `--env WANDB_API_KEY` to the above command, which will propagate your local W&B API key in the environment variable to the job.
 
 [Optional] Train a larger 13B model
 ```
 # Train a 13B model instead of the default 7B
-sky spot launch -n vicuna-7b train.yaml --env MODEL_SIZE=13
+sky jobs launch -n vicuna-7b train.yaml --env MODEL_SIZE=13
 
 # Use *unmanaged* spot instances (i.e., preemptions won't get auto-recovered).
 # Unmanaged spot provides a better interactive development experience but is vulnerable to spot preemptions.

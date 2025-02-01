@@ -4,33 +4,38 @@ import importlib
 import typing
 from typing import Dict, List, Optional, Set, Tuple, Union
 
-from sky.clouds.service_catalog.constants import (
-    HOSTED_CATALOG_DIR_URL,
-    CATALOG_SCHEMA_VERSION,
-    LOCAL_CATALOG_DIR,
-)
-from sky.clouds.service_catalog.config import use_default_catalog
+from sky.clouds.service_catalog.config import fallback_to_default_catalog
+from sky.clouds.service_catalog.constants import ALL_CLOUDS
+from sky.clouds.service_catalog.constants import CATALOG_DIR
+from sky.clouds.service_catalog.constants import CATALOG_SCHEMA_VERSION
+from sky.clouds.service_catalog.constants import HOSTED_CATALOG_DIR_URL
+from sky.utils import resources_utils
+from sky.utils import subprocess_utils
 
 if typing.TYPE_CHECKING:
     from sky.clouds import cloud
     from sky.clouds.service_catalog import common
 
 CloudFilter = Optional[Union[List[str], str]]
-_ALL_CLOUDS = ('aws', 'azure', 'gcp', 'ibm', 'lambda')
 
 
 def _map_clouds_catalog(clouds: CloudFilter, method_name: str, *args, **kwargs):
     if clouds is None:
-        clouds = list(_ALL_CLOUDS)
+        clouds = list(ALL_CLOUDS)
+
+        # TODO(hemil): Remove this once the common service catalog
+        # functions are refactored from clouds/kubernetes.py to
+        # kubernetes_catalog.py
+        if method_name != 'list_accelerators':
+            clouds.remove('kubernetes')
     single = isinstance(clouds, str)
     if single:
         clouds = [clouds]  # type: ignore
 
-    results = []
-    for cloud in clouds:
+    def _execute_catalog_method(cloud: str):
         try:
             cloud_module = importlib.import_module(
-                f'sky.clouds.service_catalog.{cloud}_catalog')
+                f'sky.clouds.service_catalog.{cloud.lower()}_catalog')
         except ModuleNotFoundError:
             raise ValueError(
                 'Cannot find module "sky.clouds.service_catalog'
@@ -41,19 +46,26 @@ def _map_clouds_catalog(clouds: CloudFilter, method_name: str, *args, **kwargs):
             raise AttributeError(
                 f'Module "{cloud}_catalog" does not '
                 f'implement the "{method_name}" method') from None
-        results.append(method(*args, **kwargs))
+        return method(*args, **kwargs)
+
+    results = subprocess_utils.run_in_parallel(_execute_catalog_method,
+                                               args=list(clouds),
+                                               num_threads=len(clouds))
     if single:
         return results[0]
     return results
 
 
-@use_default_catalog
+@fallback_to_default_catalog
 def list_accelerators(
     gpus_only: bool = True,
     name_filter: Optional[str] = None,
     region_filter: Optional[str] = None,
+    quantity_filter: Optional[int] = None,
     clouds: CloudFilter = None,
     case_sensitive: bool = True,
+    all_regions: bool = False,
+    require_price: bool = True,
 ) -> 'Dict[str, List[common.InstanceTypeInfo]]':
     """List the names of all accelerators offered by Sky.
 
@@ -64,7 +76,8 @@ def list_accelerators(
     of instance type offerings. See usage in cli.py.
     """
     results = _map_clouds_catalog(clouds, 'list_accelerators', gpus_only,
-                                  name_filter, region_filter, case_sensitive)
+                                  name_filter, region_filter, quantity_filter,
+                                  case_sensitive, all_regions, require_price)
     if not isinstance(results, list):
         results = [results]
     ret: Dict[str,
@@ -79,6 +92,7 @@ def list_accelerator_counts(
     gpus_only: bool = True,
     name_filter: Optional[str] = None,
     region_filter: Optional[str] = None,
+    quantity_filter: Optional[int] = None,
     clouds: CloudFilter = None,
 ) -> Dict[str, List[int]]:
     """List all accelerators offered by Sky and available counts.
@@ -86,8 +100,14 @@ def list_accelerator_counts(
     Returns: A dictionary of canonical accelerator names mapped to a list
     of available counts. See usage in cli.py.
     """
-    results = _map_clouds_catalog(clouds, 'list_accelerators', gpus_only,
-                                  name_filter, region_filter, False)
+    results = _map_clouds_catalog(clouds,
+                                  'list_accelerators',
+                                  gpus_only,
+                                  name_filter,
+                                  region_filter,
+                                  quantity_filter,
+                                  all_regions=False,
+                                  require_price=False)
     if not isinstance(results, list):
         results = [results]
     accelerator_counts: Dict[str, Set[int]] = collections.defaultdict(set)
@@ -99,6 +119,46 @@ def list_accelerator_counts(
     for gpu, counts in accelerator_counts.items():
         ret[gpu] = sorted(counts)
     return ret
+
+
+def list_accelerator_realtime(
+    gpus_only: bool = True,
+    name_filter: Optional[str] = None,
+    region_filter: Optional[str] = None,
+    quantity_filter: Optional[int] = None,
+    clouds: CloudFilter = None,
+    case_sensitive: bool = True,
+) -> Tuple[Dict[str, List[int]], Dict[str, int], Dict[str, int]]:
+    """List all accelerators offered by Sky with their realtime availability.
+
+    Realtime availability is the total number of accelerators in the cluster
+    and number of accelerators available at the time of the call.
+
+    Used for fixed size cluster settings, such as Kubernetes.
+
+    Returns:
+        A tuple of three dictionaries mapping canonical accelerator names to:
+        - A list of available counts. (e.g., [1, 2, 4])
+        - Total number of accelerators in the cluster (capacity).
+        - Number of accelerators available at the time of call (availability).
+    """
+    qtys_map, total_accelerators_capacity, total_accelerators_available = (
+        _map_clouds_catalog(clouds,
+                            'list_accelerators_realtime',
+                            gpus_only,
+                            name_filter,
+                            region_filter,
+                            quantity_filter,
+                            case_sensitive=case_sensitive,
+                            all_regions=False,
+                            require_price=False))
+    accelerator_counts: Dict[str, List[int]] = collections.defaultdict(list)
+    for gpu, items in qtys_map.items():
+        for item in items:
+            accelerator_counts[gpu].append(item.accelerator_count)
+        accelerator_counts[gpu] = sorted(accelerator_counts[gpu])
+    return (accelerator_counts, total_accelerators_capacity,
+            total_accelerators_available)
 
 
 def instance_type_exists(instance_type: str,
@@ -114,18 +174,6 @@ def validate_region_zone(
     """Returns the zone by name."""
     return _map_clouds_catalog(clouds, 'validate_region_zone', region_name,
                                zone_name)
-
-
-def accelerator_in_region_or_zone(
-    acc_name: str,
-    acc_count: int,
-    region: Optional[str] = None,
-    zone: Optional[str] = None,
-    clouds: CloudFilter = None,
-) -> bool:
-    """Returns True if the accelerator is in the region or zone."""
-    return _map_clouds_catalog(clouds, 'accelerator_in_region_or_zone',
-                               acc_name, acc_count, region, zone)
 
 
 def regions(clouds: CloudFilter = None) -> 'List[cloud.Region]':
@@ -174,7 +222,8 @@ def get_vcpus_mem_from_instance_type(
 
 def get_default_instance_type(cpus: Optional[str] = None,
                               memory: Optional[str] = None,
-                              disk_tier: Optional[str] = None,
+                              disk_tier: Optional[
+                                  resources_utils.DiskTier] = None,
                               clouds: CloudFilter = None) -> Optional[str]:
     """Returns the cloud's default instance type for given #vCPUs and memory.
 
@@ -193,7 +242,7 @@ def get_default_instance_type(cpus: Optional[str] = None,
 
 def get_accelerators_from_instance_type(
         instance_type: str,
-        clouds: CloudFilter = None) -> Optional[Dict[str, int]]:
+        clouds: CloudFilter = None) -> Optional[Dict[str, Union[int, float]]]:
     """Returns the accelerators from a instance type."""
     return _map_clouds_catalog(clouds, 'get_accelerators_from_instance_type',
                                instance_type)
@@ -209,7 +258,8 @@ def get_instance_type_for_accelerator(
     zone: Optional[str] = None,
     clouds: CloudFilter = None,
 ) -> Tuple[Optional[List[str]], List[str]]:
-    """
+    """Filter the instance types based on resource requirements.
+
     Returns a list of instance types satisfying the required count of
     accelerators with sorted prices and a list of candidates with fuzzy search.
     """
@@ -256,22 +306,6 @@ def get_region_zones_for_accelerators(
                                acc_name, acc_count, use_spot)
 
 
-def check_host_accelerator_compatibility(instance_type: str,
-                                         accelerators: Optional[Dict[str, int]],
-                                         clouds: CloudFilter = None) -> None:
-    """GCP only: Check if host VM type is compatible with the accelerators.
-
-    This function is invoked whenever a Resources object is created.
-    This function ensures that TPUs and GPUs (except A100) are attached to N1,
-    and A100 GPUs are attached to A2 machines. However, it does NOT check
-    the maximum vCPU count and maximum memory limits for the accelerators
-    because any Resources like GCP(n1-highmem-64, {'V100': 0.01}) can be valid
-    for sky exec/launch on an existing cluster.
-    """
-    _map_clouds_catalog(clouds, 'check_host_accelerator_compatibility',
-                        instance_type, accelerators)
-
-
 def check_accelerator_attachable_to_host(instance_type: str,
                                          accelerators: Optional[Dict[str, int]],
                                          zone: Optional[str] = None,
@@ -293,8 +327,9 @@ def get_common_gpus() -> List[str]:
         'A10G',
         'A100',
         'A100-80GB',
-        'K80',
-        'M60',
+        'H100',
+        'L4',
+        'L40S',
         'P100',
         'T4',
         'V100',
@@ -305,10 +340,13 @@ def get_common_gpus() -> List[str]:
 def get_tpus() -> List[str]:
     """Returns a list of TPU names."""
     # TODO(wei-lin): refactor below hard-coded list.
+    # There are many TPU configurations available, we show the some smallest
+    # ones for each generation, and people should find larger ones with
+    # sky show-gpus tpu.
     return [
-        'tpu-v2-8', 'tpu-v2-32', 'tpu-v2-128', 'tpu-v2-256', 'tpu-v2-512',
-        'tpu-v3-8', 'tpu-v3-32', 'tpu-v3-64', 'tpu-v3-128', 'tpu-v3-256',
-        'tpu-v3-512', 'tpu-v3-1024', 'tpu-v3-2048'
+        'tpu-v2-8', 'tpu-v3-8', 'tpu-v4-8', 'tpu-v4-16', 'tpu-v4-32',
+        'tpu-v5litepod-1', 'tpu-v5litepod-4', 'tpu-v5litepod-8', 'tpu-v5p-8',
+        'tpu-v5p-16', 'tpu-v5p-32', 'tpu-v6e-1', 'tpu-v6e-4', 'tpu-v6e-8'
     ]
 
 
@@ -341,9 +379,10 @@ __all__ = [
     'get_image_id_from_tag',
     'is_image_tag_valid',
     # Configuration
-    'use_default_catalog',
+    'fallback_to_default_catalog',
     # Constants
+    'ALL_CLOUDS',
     'HOSTED_CATALOG_DIR_URL',
     'CATALOG_SCHEMA_VERSION',
-    'LOCAL_CATALOG_DIR',
+    'CATALOG_DIR',
 ]

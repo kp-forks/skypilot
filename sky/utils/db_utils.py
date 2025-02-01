@@ -1,7 +1,37 @@
 """Utils for sky databases."""
-import threading
+import contextlib
 import sqlite3
-from typing import Callable
+import threading
+from typing import Any, Callable, Optional
+
+# This parameter (passed to sqlite3.connect) controls how long we will wait to
+# obtains a database lock (not necessarily during connection, but whenever it is
+# needed). It is not a connection timeout.
+# Even in WAL mode, only a single writer is allowed at a time. Other writers
+# will block until the write lock can be obtained. This behavior is described in
+# the SQLite documentation for WAL: https://www.sqlite.org/wal.html
+# Python's default timeout is 5s. In normal usage, lock contention is very low,
+# and this is more than sufficient. However, in some highly concurrent cases,
+# such as a jobs controller suddenly recovering thousands of jobs at once, we
+# can see a small number of processes that take much longer to obtain the lock.
+# In contrived highly contentious cases, around 0.1% of transactions will take
+# >30s to take the lock. We have not seen cases that take >60s. For cases up to
+# 1000x parallelism, this is thus thought to be a conservative setting.
+# For more info, see the PR description for #4552.
+_DB_TIMEOUT_S = 60
+
+
+@contextlib.contextmanager
+def safe_cursor(db_path: str):
+    """A newly created, auto-committing, auto-closing cursor."""
+    conn = sqlite3.connect(db_path, timeout=_DB_TIMEOUT_S)
+    cursor = conn.cursor()
+    try:
+        yield cursor
+    finally:
+        cursor.close()
+        conn.commit()
+        conn.close()
 
 
 def add_column_to_table(
@@ -10,6 +40,8 @@ def add_column_to_table(
     table_name: str,
     column_name: str,
     column_type: str,
+    copy_from: Optional[str] = None,
+    value_to_replace_existing_entries: Optional[Any] = None,
 ):
     """Add a column to a table."""
     for row in cursor.execute(f'PRAGMA table_info({table_name})'):
@@ -17,8 +49,18 @@ def add_column_to_table(
             break
     else:
         try:
-            cursor.execute(f'ALTER TABLE {table_name} '
-                           f'ADD COLUMN {column_name} {column_type}')
+            add_column_cmd = (f'ALTER TABLE {table_name} '
+                              f'ADD COLUMN {column_name} {column_type}')
+            cursor.execute(add_column_cmd)
+            if copy_from is not None:
+                cursor.execute(f'UPDATE {table_name} '
+                               f'SET {column_name} = {copy_from}')
+            if value_to_replace_existing_entries is not None:
+                cursor.execute(
+                    f'UPDATE {table_name} '
+                    f'SET {column_name} = (?) '
+                    f'WHERE {column_name} IS NULL',
+                    (value_to_replace_existing_entries,))
         except sqlite3.OperationalError as e:
             if 'duplicate column name' in str(e):
                 # We may be trying to add the same column twice, when
@@ -53,8 +95,6 @@ class SQLiteConn(threading.local):
     def __init__(self, db_path: str, create_table: Callable):
         super().__init__()
         self.db_path = db_path
-        # NOTE: We use a timeout of 10 seconds to avoid database locked
-        # errors. This is a hack, but it works.
-        self.conn = sqlite3.connect(db_path, timeout=10)
+        self.conn = sqlite3.connect(db_path, timeout=_DB_TIMEOUT_S)
         self.cursor = self.conn.cursor()
         create_table(self.cursor, self.conn)

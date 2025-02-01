@@ -2,53 +2,51 @@
 
 # pylint: disable=import-outside-toplevel
 
-from sky import sky_logging
-import yaml
-import os
 import json
+import multiprocessing
+import os
+
 import requests
-import functools
+import yaml
+
+from sky import sky_logging
+from sky.adaptors import common
 
 CREDENTIAL_FILE = '~/.ibm/credentials.yaml'
 logger = sky_logging.init_logger(__name__)
 
-ibm_vpc = None
-ibm_cloud_sdk_core = None
-ibm_platform_services = None
-
-
-def import_package(func):
-
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        global ibm_vpc, ibm_cloud_sdk_core, ibm_platform_services
-        if None in [ibm_vpc, ibm_cloud_sdk_core, ibm_platform_services]:
-            try:
-                import ibm_vpc as _ibm_vpc
-                import ibm_cloud_sdk_core as _ibm_cloud_sdk_core
-                import ibm_platform_services as _ibm_platform_services
-                ibm_vpc = _ibm_vpc
-                ibm_cloud_sdk_core = _ibm_cloud_sdk_core
-                ibm_platform_services = _ibm_platform_services
-            except ImportError:
-                raise ImportError(
-                    'Failed to import dependencies for IBM. '
-                    'Try running: pip install "skypilot[ibm]".\n') from None
-        return func(*args, **kwargs)
-
-    return wrapper
+_IMPORT_ERROR_MESSAGE = ('Failed to import dependencies for IBM. '
+                         'Try running: pip install "skypilot[ibm]".\n')
+ibm_vpc = common.LazyImport('ibm_vpc',
+                            import_error_message=_IMPORT_ERROR_MESSAGE)
+ibm_cloud_sdk_core = common.LazyImport(
+    'ibm_cloud_sdk_core', import_error_message=_IMPORT_ERROR_MESSAGE)
+ibm_platform_services = common.LazyImport(
+    'ibm_platform_services', import_error_message=_IMPORT_ERROR_MESSAGE)
+ibm_boto3 = common.LazyImport('ibm_boto3',
+                              import_error_message=_IMPORT_ERROR_MESSAGE)
+ibm_botocore = common.LazyImport('ibm_botocore',
+                                 import_error_message=_IMPORT_ERROR_MESSAGE)
 
 
 def read_credential_file():
-    with open(os.path.expanduser(CREDENTIAL_FILE), encoding='utf-8') as f:
-        return yaml.safe_load(f)
+    try:
+        with open(os.path.expanduser(CREDENTIAL_FILE), 'r',
+                  encoding='utf-8') as f:
+            return yaml.safe_load(f)
+    except FileNotFoundError:
+        return {}
 
 
 def get_api_key():
     return read_credential_file()['iam_api_key']
 
 
-@import_package
+def get_hmac_keys():
+    cred_file = read_credential_file()
+    return cred_file['access_key_id'], cred_file['secret_access_key']
+
+
 def _get_authenticator():
     return ibm_cloud_sdk_core.authenticators.IAMAuthenticator(get_api_key())
 
@@ -68,7 +66,6 @@ def get_oauth_token():
     return json.loads(res.text)['access_token']
 
 
-@import_package
 def client(**kwargs):
     """Create an ibm vpc client.
 
@@ -95,13 +92,69 @@ def client(**kwargs):
     return vpc_client  # returns either formerly or newly created client
 
 
-@import_package
 def search_client():
     return ibm_platform_services.GlobalSearchV2(
         authenticator=_get_authenticator())
 
 
-@import_package
 def tagging_client():
     return ibm_platform_services.GlobalTaggingV1(
         authenticator=_get_authenticator())
+
+
+def get_cos_client(region: str = 'us-east'):
+    """Returns an IBM COS client object.
+      Using process lock to protect not multi process
+      safe Boto3.session, which is invoked (default session) by
+      boto3.client.
+
+    Args:
+        region (str, optional): Client endpoint. Defaults to 'us-east'.
+
+    Returns:
+        IBM COS client
+    """
+    access_key_id, secret_access_key = get_hmac_keys()
+    with _get_global_process_lock():
+        return ibm_boto3.client(  # type: ignore[union-attr]
+            service_name='s3',
+            aws_access_key_id=access_key_id,
+            aws_secret_access_key=secret_access_key,
+            endpoint_url=
+            f'https://s3.{region}.cloud-object-storage.appdomain.cloud')
+
+
+def get_cos_resource(region: str = 'us-east'):
+    """Returns an IBM COS Resource object.
+      Using process lock to protect not multi process safe
+      boto3.Resource.
+
+    Args:
+        region (str, optional): Resource Endpoint. Defaults to 'us-east'.
+
+    Returns:
+        IBM COS Resource
+    """
+    access_key_id, secret_access_key = get_hmac_keys()
+    with _get_global_process_lock():
+        return ibm_boto3.resource(  # type: ignore[union-attr]
+            's3',
+            aws_access_key_id=access_key_id,
+            aws_secret_access_key=secret_access_key,
+            endpoint_url=
+            f'https://s3.{region}.cloud-object-storage.appdomain.cloud')
+
+
+def _get_global_process_lock():
+    """returns a multi-process lock.
+
+    lazily initializes a global multi-process lock if it wasn't
+      already initialized.
+    Necessary when process are spawned without a shared lock.
+    """
+    global global_process_lock  # pylint: disable=global-variable-undefined
+
+    if 'global_process_lock' not in globals():
+        global_process_lock = multiprocessing.Lock()
+
+    return global_process_lock

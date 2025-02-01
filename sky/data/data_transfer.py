@@ -24,8 +24,10 @@ import colorama
 
 from sky import clouds
 from sky import sky_logging
-from sky.adaptors import aws, gcp
-from sky.utils import log_utils
+from sky.adaptors import aws
+from sky.adaptors import gcp
+from sky.data import data_utils
+from sky.utils import rich_utils
 from sky.utils import ux_utils
 
 logger = sky_logging.init_logger(__name__)
@@ -44,12 +46,13 @@ def s3_to_gcs(s3_bucket_name: str, gs_bucket_name: str) -> None:
       s3_bucket_name: str; Name of the Amazon S3 Bucket
       gs_bucket_name: str; Name of the Google Cloud Storage Bucket
     """
-    from oauth2client.client import GoogleCredentials  # pylint: disable=import-outside-toplevel
+    # pylint: disable=import-outside-toplevel
+    import google.auth
 
-    oauth_credentials = GoogleCredentials.get_application_default()
+    credentials, _ = google.auth.default()
     storagetransfer = gcp.build('storagetransfer',
                                 'v1',
-                                credentials=oauth_credentials)
+                                credentials=credentials)
 
     session = aws.session()
     aws_credentials = session.get_credentials().get_frozen_credentials()
@@ -94,7 +97,7 @@ def s3_to_gcs(s3_bucket_name: str, gs_bucket_name: str) -> None:
     logger.debug(json.dumps(operation, indent=4))
     logger.info('Waiting for the transfer to finish')
     start = time.time()
-    with log_utils.safe_rich_status('Transferring'):
+    with rich_utils.safe_status('Transferring'):
         for _ in range(MAX_POLLS):
             result = (storagetransfer.transferOperations().get(
                 name=operation['name']).execute())
@@ -139,9 +142,9 @@ def gcs_to_s3(gs_bucket_name: str, s3_bucket_name: str) -> None:
       gs_bucket_name: str; Name of the Google Cloud Storage Bucket
       s3_bucket_name: str; Name of the Amazon S3 Bucket
     """
-    sync_command = (f'gsutil -m rsync -rd gs://{gs_bucket_name} '
-                    f's3://{s3_bucket_name}')
-
+    gsutil_alias, alias_gen = data_utils.get_gsutil_command()
+    sync_command = (f'{alias_gen}; {gsutil_alias} '
+                    f'rsync -rd gs://{gs_bucket_name} s3://{s3_bucket_name}')
     subprocess.call(sync_command, shell=True)
 
 
@@ -197,3 +200,40 @@ def _add_bucket_iam_member(bucket_name: str, role: str, member: str) -> None:
     bucket.set_iam_policy(policy)
 
     logger.debug(f'Added {member} with role {role} to {bucket_name}.')
+
+
+def s3_to_oci(s3_bucket_name: str, oci_bucket_name: str) -> None:
+    """Creates a one-time transfer from Amazon S3 to OCI Object Storage.
+    Args:
+      s3_bucket_name: str; Name of the Amazon S3 Bucket
+      oci_bucket_name: str; Name of the OCI Bucket
+    """
+    # TODO(HysunHe): Implement sync with other clouds (s3, gs)
+    raise NotImplementedError('Moving data directly from S3 to OCI bucket '
+                              'is currently not supported. Please specify '
+                              'a local source for the storage object.')
+
+
+def gcs_to_oci(gs_bucket_name: str, oci_bucket_name: str) -> None:
+    """Creates a one-time transfer from Google Cloud Storage to
+    OCI Object Storage.
+    Args:
+      gs_bucket_name: str; Name of the Google Cloud Storage Bucket
+      oci_bucket_name: str; Name of the OCI Bucket
+    """
+    # TODO(HysunHe): Implement sync with other clouds (s3, gs)
+    raise NotImplementedError('Moving data directly from GCS to OCI bucket '
+                              'is currently not supported. Please specify '
+                              'a local source for the storage object.')
+
+
+def r2_to_oci(r2_bucket_name: str, oci_bucket_name: str) -> None:
+    """Creates a one-time transfer from Cloudflare R2 to OCI Bucket.
+    Args:
+      r2_bucket_name: str; Name of the Cloudflare R2 Bucket
+      oci_bucket_name: str; Name of the OCI Bucket
+    """
+    raise NotImplementedError(
+        'Moving data directly from Cloudflare R2 to OCI '
+        'bucket is currently not supported. Please specify '
+        'a local source for the storage object.')

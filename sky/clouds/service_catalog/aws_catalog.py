@@ -3,25 +3,32 @@
 This module loads the service catalog file and can be used to query
 instance types and pricing information for AWS.
 """
-import colorama
 import glob
 import hashlib
 import os
 import threading
 import typing
-from typing import Dict, List, Optional, Tuple
-
-import pandas as pd
+from typing import Dict, List, Optional, Tuple, Union
 
 from sky import exceptions
 from sky import sky_logging
+from sky.adaptors import common as adaptors_common
 from sky.clouds import aws
 from sky.clouds.service_catalog import common
 from sky.clouds.service_catalog import config
 from sky.clouds.service_catalog.data_fetchers import fetch_aws
+from sky.utils import common_utils
+from sky.utils import resources_utils
+from sky.utils import rich_utils
+from sky.utils import timeline
+from sky.utils import ux_utils
 
 if typing.TYPE_CHECKING:
+    import pandas as pd
+
     from sky.clouds import cloud
+else:
+    pd = adaptors_common.LazyImport('pandas')
 
 logger = sky_logging.init_logger(__name__)
 
@@ -64,8 +71,38 @@ _apply_az_mapping_lock = threading.Lock()
 _image_df = common.read_catalog('aws/images.csv',
                                 pull_frequency_hours=_PULL_FREQUENCY_HOURS)
 
+_quotas_df = common.read_catalog('aws/instance_quota_mapping.csv',
+                                 pull_frequency_hours=_PULL_FREQUENCY_HOURS)
 
-def _fetch_and_apply_az_mapping(df: pd.DataFrame) -> pd.DataFrame:
+
+def _get_az_mappings(aws_user_hash: str) -> Optional['pd.DataFrame']:
+    filename = f'aws/az_mappings-{aws_user_hash}.csv'
+    az_mapping_path = common.get_catalog_path(filename)
+    az_mapping_md5_path = common.get_catalog_path(f'.meta/{filename}.md5')
+    if not os.path.exists(az_mapping_path):
+        az_mappings = None
+        if aws_user_hash != 'default':
+            # Fetch az mapping from AWS.
+            with rich_utils.safe_status(
+                    ux_utils.spinner_message('AWS: Fetching availability '
+                                             'zones mapping')):
+                az_mappings = fetch_aws.fetch_availability_zone_mappings()
+        else:
+            return None
+        az_mappings.to_csv(az_mapping_path, index=False)
+        # Write md5 of the az_mapping file to a file so we can check it for
+        # any changes when uploading to the controller
+        with open(az_mapping_path, 'r', encoding='utf-8') as f:
+            az_mapping_hash = hashlib.md5(f.read().encode()).hexdigest()
+        with open(az_mapping_md5_path, 'w', encoding='utf-8') as f:
+            f.write(az_mapping_hash)
+    else:
+        az_mappings = pd.read_csv(az_mapping_path)
+    return az_mappings
+
+
+@timeline.event
+def _fetch_and_apply_az_mapping(df: common.LazyDataFrame) -> 'pd.DataFrame':
     """Maps zone IDs (use1-az1) to zone names (us-east-1x).
 
     The upper-level functions that use the availability zone information
@@ -87,7 +124,7 @@ def _fetch_and_apply_az_mapping(df: pd.DataFrame) -> pd.DataFrame:
         with the zone name (e.g. us-east-1a).
     """
     try:
-        user_identity_list = aws.AWS.get_current_user_identity()
+        user_identity_list = aws.AWS.get_active_user_identity()
         assert user_identity_list, user_identity_list
         user_identity = user_identity_list[0]
         aws_user_hash = hashlib.md5(user_identity.encode()).hexdigest()[:8]
@@ -111,23 +148,12 @@ def _fetch_and_apply_az_mapping(df: pd.DataFrame) -> pd.DataFrame:
             'Failed to get AWS user identity. Using the latest mapping '
             f'file for user {aws_user_hash!r}.')
 
-    az_mapping_path = common.get_catalog_path(
-        f'aws/az_mappings-{aws_user_hash}.csv')
-    if not os.path.exists(az_mapping_path):
-        az_mappings = None
-        if aws_user_hash != 'default':
-            # Fetch az mapping from AWS.
-            logger.info(f'{colorama.Style.DIM}Fetching availability zones '
-                        f'mapping for AWS...{colorama.Style.RESET_ALL}')
-            az_mappings = fetch_aws.fetch_availability_zone_mappings()
-        else:
-            # Returning the original dataframe directly, as no cloud
-            # identity can be fetched which suggests there are no
-            # credentials.
-            return df
-        az_mappings.to_csv(az_mapping_path, index=False)
-    else:
-        az_mappings = pd.read_csv(az_mapping_path)
+    az_mappings = _get_az_mappings(aws_user_hash)
+    if az_mappings is None:
+        # Returning the original dataframe directly, as no cloud
+        # identity can be fetched which suggests there are no
+        # credentials.
+        return df
     # Use inner join to drop rows with unknown AZ IDs, which are likely
     # because the user does not have access to that Region. Otherwise,
     # there will be rows with NaN in the AvailabilityZone column.
@@ -137,15 +163,41 @@ def _fetch_and_apply_az_mapping(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _get_df() -> pd.DataFrame:
-    if config.get_use_default_catalog():
-        return _default_df
-    else:
-        global _user_df
-        with _apply_az_mapping_lock:
-            if _user_df is None:
+def _get_df() -> 'pd.DataFrame':
+    global _user_df
+    with _apply_az_mapping_lock:
+        if _user_df is None:
+            try:
                 _user_df = _fetch_and_apply_az_mapping(_default_df)
-        return _user_df
+            except (RuntimeError, ImportError) as e:
+                if config.get_use_default_catalog_if_failed():
+                    logger.warning('Failed to fetch availability zone mapping. '
+                                   f'{common_utils.format_exception(e)}')
+                    return _default_df
+                else:
+                    raise
+    return _user_df
+
+
+def get_quota_code(instance_type: str, use_spot: bool) -> Optional[str]:
+    """Get the quota code based on `instance_type` and `use_spot`.
+
+    The quota code is fetched from `_quotas_df` based on the instance type
+    specified, and will then be utilized in a botocore API command in order
+    to check its quota.
+    """
+
+    if use_spot:
+        spot_header = 'SpotInstanceCode'
+    else:
+        spot_header = 'OnDemandInstanceCode'
+    try:
+        quota_code = _quotas_df.loc[_quotas_df['InstanceType'] == instance_type,
+                                    spot_header].values[0]
+        return quota_code
+
+    except IndexError:
+        return None
 
 
 def instance_type_exists(instance_type: str) -> bool:
@@ -156,14 +208,6 @@ def validate_region_zone(
         region: Optional[str],
         zone: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
     return common.validate_region_zone_impl('aws', _get_df(), region, zone)
-
-
-def accelerator_in_region_or_zone(acc_name: str,
-                                  acc_count: int,
-                                  region: Optional[str] = None,
-                                  zone: Optional[str] = None) -> bool:
-    return common.accelerator_in_region_or_zone_impl(_get_df(), acc_name,
-                                                     acc_count, region, zone)
 
 
 def get_hourly_cost(instance_type: str,
@@ -180,9 +224,10 @@ def get_vcpus_mem_from_instance_type(
                                                         instance_type)
 
 
-def get_default_instance_type(cpus: Optional[str] = None,
-                              memory: Optional[str] = None,
-                              disk_tier: Optional[str] = None) -> Optional[str]:
+def get_default_instance_type(
+        cpus: Optional[str] = None,
+        memory: Optional[str] = None,
+        disk_tier: Optional[resources_utils.DiskTier] = None) -> Optional[str]:
     del disk_tier  # unused
     if cpus is None and memory is None:
         cpus = f'{_DEFAULT_NUM_VCPUS}+'
@@ -200,7 +245,7 @@ def get_default_instance_type(cpus: Optional[str] = None,
 
 
 def get_accelerators_from_instance_type(
-        instance_type: str) -> Optional[Dict[str, int]]:
+        instance_type: str) -> Optional[Dict[str, Union[int, float]]]:
     return common.get_accelerators_from_instance_type_impl(
         _get_df(), instance_type)
 
@@ -214,9 +259,11 @@ def get_instance_type_for_accelerator(
     region: Optional[str] = None,
     zone: Optional[str] = None,
 ) -> Tuple[Optional[List[str]], List[str]]:
-    """
+    """Filter the instance types based on resource requirements.
+
     Returns a list of instance types satisfying the required count of
-    accelerators with sorted prices and a list of candidates with fuzzy search.
+    accelerators/cpus/memory with sorted prices and a list of candidates with
+    fuzzy search.
     """
     return common.get_instance_type_for_accelerator_impl(df=_get_df(),
                                                          acc_name=acc_name,
@@ -249,17 +296,31 @@ def list_accelerators(
         gpus_only: bool,
         name_filter: Optional[str],
         region_filter: Optional[str],
-        case_sensitive: bool = True
-) -> Dict[str, List[common.InstanceTypeInfo]]:
+        quantity_filter: Optional[int],
+        case_sensitive: bool = True,
+        all_regions: bool = False,
+        require_price: bool = True) -> Dict[str, List[common.InstanceTypeInfo]]:
     """Returns all instance types in AWS offering accelerators."""
+    del require_price  # Unused.
     return common.list_accelerators_impl('AWS', _get_df(), gpus_only,
                                          name_filter, region_filter,
-                                         case_sensitive)
+                                         quantity_filter, case_sensitive,
+                                         all_regions)
 
 
 def get_image_id_from_tag(tag: str, region: Optional[str]) -> Optional[str]:
     """Returns the image id from the tag."""
-    return common.get_image_id_from_tag_impl(_image_df, tag, region)
+    global _image_df
+
+    image_id = common.get_image_id_from_tag_impl(_image_df, tag, region)
+    if image_id is None:
+        # Refresh the image catalog and try again, if the image tag is not
+        # found.
+        logger.debug('Refreshing the image catalog and trying again.')
+        _image_df = common.read_catalog('aws/images.csv',
+                                        pull_frequency_hours=0)
+        image_id = common.get_image_id_from_tag_impl(_image_df, tag, region)
+    return image_id
 
 
 def is_image_tag_valid(tag: str, region: Optional[str]) -> bool:

@@ -1,17 +1,19 @@
 """IBM Web Services."""
 import os
-import yaml
-import json
-from sky import clouds
-from sky.clouds import service_catalog
-from sky.adaptors import ibm
-from sky import sky_logging
 import typing
-from typing import Dict, Iterator, List, Optional, Tuple
-from sky.adaptors.ibm import CREDENTIAL_FILE
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
-from sky.clouds.cloud import Zone
+import colorama
+
+from sky import clouds
+from sky import sky_logging
+from sky import status_lib
+from sky.adaptors import ibm
+from sky.adaptors.ibm import CREDENTIAL_FILE
+from sky.clouds import service_catalog
+from sky.utils import resources_utils
 from sky.utils import ux_utils
+
 if typing.TYPE_CHECKING:
     # renaming to avoid shadowing variables
     from sky import resources as resources_lib
@@ -32,12 +34,30 @@ class IBM(clouds.Cloud):
     _regions: List[clouds.Region] = []
 
     @classmethod
-    def _cloud_unsupported_features(
-            cls) -> Dict[clouds.CloudImplementationFeatures, str]:
-        return dict()
+    def _unsupported_features_for_resources(
+        cls, resources: 'resources_lib.Resources'
+    ) -> Dict[clouds.CloudImplementationFeatures, str]:
+        features = {
+            clouds.CloudImplementationFeatures.CLONE_DISK_FROM_CLUSTER:
+                (f'Migrating disk is currently not supported on {cls._REPR}.'),
+            clouds.CloudImplementationFeatures.DOCKER_IMAGE:
+                (f'Docker image is currently not supported on {cls._REPR}. '
+                 'You can try running docker command inside the '
+                 '`run` section in task.yaml.'),
+            clouds.CloudImplementationFeatures.CUSTOM_DISK_TIER:
+                (f'Custom disk tier is currently not supported on {cls._REPR}.'
+                ),
+            clouds.CloudImplementationFeatures.OPEN_PORTS:
+                (f'Opening ports is currently not supported on {cls._REPR}.'),
+        }
+        if resources.use_spot:
+            features[clouds.CloudImplementationFeatures.STOP] = (
+                'Stopping spot instances is currently not supported on'
+                f' {cls._REPR}.')
+        return features
 
     @classmethod
-    def _max_cluster_name_length(cls) -> Optional[int]:
+    def max_cluster_name_length(cls) -> Optional[int]:
         return cls._MAX_CLUSTER_NAME_LEN_LIMIT
 
     @classmethod
@@ -46,8 +66,8 @@ class IBM(clouds.Cloud):
                               use_spot: bool, region: Optional[str],
                               zone: Optional[str]) -> List[clouds.Region]:
         del accelerators  # unused
-        assert use_spot is False, (
-            'current IBM implementation doesn\'t support spot instances')
+        if use_spot:
+            return []
         regions = service_catalog.get_region_zones_for_instance_type(
             instance_type, use_spot, 'ibm')
 
@@ -69,7 +89,7 @@ class IBM(clouds.Cloud):
         instance_type: str,
         accelerators: Optional[Dict[str, int]] = None,
         use_spot: bool = False,
-    ) -> Iterator[Optional[List[Zone]]]:
+    ) -> Iterator[Optional[List[clouds.Zone]]]:
         """Loops over (region, zones) to retry for provisioning.
 
         returning a single zone list with its region,
@@ -123,10 +143,10 @@ class IBM(clouds.Cloud):
         # Currently Isn't implemented in the same manner by aws and azure.
         return 0
 
-    def get_egress_cost(self, num_gigabytes):
+    def get_egress_cost(self, num_gigabytes: float):
         """Returns the egress cost. Currently true for us-south, i.e. Dallas.
         based on https://cloud.ibm.com/objectstorage/create#pricing. """
-        cost = 0
+        cost = 0.
         price_thresholds = [{
             'threshold': 150,
             'price_per_gb': 0.05
@@ -144,14 +164,14 @@ class IBM(clouds.Cloud):
             num_gigabytes -= (num_gigabytes - price_threshold['threshold'])
         return cost
 
-    def is_same_cloud(self, other):
-        return isinstance(other, IBM)
-
     def make_deploy_resources_variables(
         self,
         resources: 'resources_lib.Resources',
+        cluster_name: resources_utils.ClusterName,
         region: 'clouds.Region',
         zones: Optional[List['clouds.Zone']],
+        num_nodes: int,
+        dryrun: bool = False,
     ) -> Dict[str, Optional[str]]:
         """Converts planned sky.Resources to cloud-specific resource variables.
 
@@ -164,6 +184,7 @@ class IBM(clouds.Cloud):
         Returns:
           A dictionary of cloud-specific node type variables.
         """
+        del cluster_name, dryrun  # Unused.
 
         def _get_profile_resources(instance_profile):
             """returns a dict representing the
@@ -185,10 +206,8 @@ class IBM(clouds.Cloud):
             'IBM does not currently support spot instances in this framework'
 
         acc_dict = self.get_accelerators_from_instance_type(r.instance_type)
-        if acc_dict is not None:
-            custom_resources = json.dumps(acc_dict, separators=(',', ':'))
-        else:
-            custom_resources = None
+        custom_resources = resources_utils.make_ray_custom_resources_str(
+            acc_dict)
 
         instance_resources = _get_profile_resources(r.instance_type)
 
@@ -226,7 +245,7 @@ class IBM(clouds.Cloud):
     def get_accelerators_from_instance_type(
         cls,
         instance_type: str,
-    ) -> Optional[Dict[str, int]]:
+    ) -> Optional[Dict[str, Union[int, float]]]:
         """Returns {acc: acc_count} held by 'instance_type', if any."""
         return service_catalog.get_accelerators_from_instance_type(
             instance_type, clouds='ibm')
@@ -236,27 +255,24 @@ class IBM(clouds.Cloud):
             cls,
             cpus: Optional[str] = None,
             memory: Optional[str] = None,
-            disk_tier: Optional[str] = None) -> Optional[str]:
+            disk_tier: Optional[resources_utils.DiskTier] = None
+    ) -> Optional[str]:
         return service_catalog.get_default_instance_type(cpus=cpus,
                                                          memory=memory,
                                                          disk_tier=disk_tier,
                                                          clouds='ibm')
 
-    def get_feasible_launchable_resources(self,
-                                          resources: 'resources_lib.Resources'):
-        """Returns a list of feasible and launchable resources.
-
-        Feasible resources refer to an offering respecting the resource
-        requirements.  Currently, this function implements "filtering" the
-        cloud's offerings only w.r.t. accelerators constraints.
-
-        Launchable resources require a cloud and an instance type be assigned.
-        """
-        fuzzy_candidate_list: Optional[List[str]] = []
+    def _get_feasible_launchable_resources(
+        self, resources: 'resources_lib.Resources'
+    ) -> 'resources_utils.FeasibleResources':
+        fuzzy_candidate_list: List[str] = []
         if resources.instance_type is not None:
             assert resources.is_launchable(), resources
             resources = resources.copy(accelerators=None)
-            return ([resources], fuzzy_candidate_list)
+            # TODO: Add hints to all return values in this method to help
+            #  users understand why the resources are not launchable.
+            return resources_utils.FeasibleResources([resources],
+                                                     fuzzy_candidate_list, None)
 
         def _make(instance_list):
             resource_list = []
@@ -281,9 +297,10 @@ class IBM(clouds.Cloud):
                 memory=resources.memory,
                 disk_tier=resources.disk_tier)
             if default_instance_type is None:
-                return ([], [])
+                return resources_utils.FeasibleResources([], [], None)
             else:
-                return (_make([default_instance_type]), [])
+                return resources_utils.FeasibleResources(
+                    _make([default_instance_type]), [], None)
 
         assert len(accelerators) == 1, resources
         acc, acc_count = list(accelerators.items())[0]
@@ -297,13 +314,15 @@ class IBM(clouds.Cloud):
             zone=resources.zone,
             clouds='ibm')
         if instance_list is None:
-            return ([], fuzzy_candidate_list)
-        return (_make(instance_list), fuzzy_candidate_list)
+            return resources_utils.FeasibleResources([], fuzzy_candidate_list,
+                                                     None)
+        return resources_utils.FeasibleResources(_make(instance_list),
+                                                 fuzzy_candidate_list, None)
 
     @classmethod
     def get_default_image(cls, region) -> str:
-        """
-        Returns default image id, currently stock ubuntu 22-04.
+        """Returns default image id, currently stock ubuntu 22-04.
+
         if user specified 'image_id' in ~/.ibm/credentials.yaml
             matching this 'region', returns it instead.
         """
@@ -337,7 +356,8 @@ class IBM(clouds.Cloud):
             and img['operating_system']['architecture'].startswith(
                 'amd')))['id']
 
-    def get_image_size(self, image_id: str, region: Optional[str]) -> float:
+    @classmethod
+    def get_image_size(cls, image_id: str, region: Optional[str]) -> float:
         assert region is not None, (image_id, region)
         client = ibm.client(region=region)
         try:
@@ -346,8 +366,16 @@ class IBM(clouds.Cloud):
         except ibm.ibm_cloud_sdk_core.ApiException as e:  # type: ignore[union-attr]
             logger.error(e.message)
             with ux_utils.print_exception_no_traceback():
-                raise ValueError(f'Image {image_id!r} not found in '
-                                 f'IBM region "{region}"') from None
+                raise ValueError(
+                    f'Image {image_id!r} not found in IBM region "{region}".\n'
+                    '\nTo use image id in IBM, create a private VPC image and '
+                    'paste its ID in the image_id section.\n'
+                    '\nTo create an image manually:\n'
+                    'https://cloud.ibm.com/docs/vpc?topic=vpc-creating-and-using-an-image-from-volume\n'  # pylint: disable=line-too-long
+                    '\nTo use an official VPC image creation tool:\n'
+                    'https://www.ibm.com/cloud/blog/use-ibm-packer-plugin-to-create-custom-images-on-ibm-cloud-vpc-infrastructure\n'  # pylint: disable=line-too-long
+                    '\nTo use a more limited but easier to manage tool:\n'
+                    'https://github.com/IBM/vpc-img-inst') from None
         try:
             # image_size['file']['size'] is not relevant, since
             # the minimum size of a volume onto which this image
@@ -368,22 +396,32 @@ class IBM(clouds.Cloud):
     @classmethod
     def check_credentials(cls) -> Tuple[bool, Optional[str]]:
         """Checks if the user has access credentials to this cloud."""
-        # IBM-TODO - create a configuration script.
+
         required_fields = ['iam_api_key', 'resource_group_id']
+        ibm_cos_fields = ['access_key_id', 'secret_access_key']
         help_str = ('    Store your API key and Resource Group id '
                     f'in {CREDENTIAL_FILE} in the following format:\n'
                     '      iam_api_key: <IAM_API_KEY>\n'
                     '      resource_group_id: <RESOURCE_GROUP_ID>')
+        base_config = ibm.read_credential_file()
 
-        base_config = _read_credential_file()
         if not base_config:
             return (False, 'Missing credential file at '
                     f'{os.path.expanduser(CREDENTIAL_FILE)}.\n' + help_str)
+        # TODO(IBM) update when issue #1943 is resolved.
+        if set(ibm_cos_fields) - set(base_config):
+            logger.debug(f'{colorama.Fore.RED}IBM Storage is missing the '
+                         'following fields in '
+                         f'{os.path.expanduser(CREDENTIAL_FILE)} to function: '
+                         f"""{", ".join(list(
+                            set(ibm_cos_fields) - set(base_config)))}"""
+                         f'{colorama.Style.RESET_ALL}')
 
-        for field in required_fields:
-            if field not in base_config:
-                return (False, f'Missing field "{field}" in '
-                        f'{os.path.expanduser(CREDENTIAL_FILE)}.\n' + help_str)
+        if set(required_fields) - set(base_config):
+            return (
+                False, f'Missing field(s): '
+                f'{", ".join(list(set(required_fields) - set(base_config)))} '
+                f'in {os.path.expanduser(CREDENTIAL_FILE)}.\n{help_str}')
 
         # verifies ability of user to create a client,
         # e.g. bad API KEY.
@@ -393,11 +431,6 @@ class IBM(clouds.Cloud):
         # pylint: disable=W0703
         except Exception as e:
             return (False, f'{str(e)}' + help_str)
-
-    @classmethod
-    def check_disk_tier_enabled(cls, instance_type: str,
-                                disk_tier: str) -> None:
-        del instance_type, disk_tier  # unused
 
     def get_credential_file_mounts(self) -> Dict[str, str]:
         """Returns a {remote:local} credential path mapping
@@ -414,29 +447,49 @@ class IBM(clouds.Cloud):
         """Validates the region and zone."""
         return service_catalog.validate_region_zone(region, zone, clouds='ibm')
 
-    def accelerator_in_region_or_zone(self,
-                                      accelerator: str,
-                                      acc_count: int,
-                                      region: Optional[str] = None,
-                                      zone: Optional[str] = None) -> bool:
-        """Returns whether the accelerator is valid in the region or zone."""
-        return service_catalog.accelerator_in_region_or_zone(
-            accelerator, acc_count, region, zone, 'ibm')
+    @classmethod
+    def query_status(cls, name: str, tag_filters: Dict[str, str],
+                     region: Optional[str], zone: Optional[str],
+                     **kwargs) -> List['status_lib.ClusterStatus']:
+        del tag_filters, zone, kwargs  # unused
 
+        status_map: Dict[str, Any] = {
+            'pending': status_lib.ClusterStatus.INIT,
+            'starting': status_lib.ClusterStatus.INIT,
+            'restarting': status_lib.ClusterStatus.INIT,
+            'running': status_lib.ClusterStatus.UP,
+            'stopping': status_lib.ClusterStatus.STOPPED,
+            'stopped': status_lib.ClusterStatus.STOPPED,
+            'deleting': None,
+            'failed': status_lib.ClusterStatus.INIT,
+            'cluster_deleted': []
+        }
 
-def _read_credential_file():
-    try:
-        with open(os.path.expanduser(CREDENTIAL_FILE), 'r',
-                  encoding='utf-8') as f:
-            return yaml.safe_load(f)
-    except FileNotFoundError:
-        return False
+        client = ibm.client(region=region)
+        search_client = ibm.search_client()
+        # pylint: disable=E1136
+        vpcs_filtered_by_tags_and_region = search_client.search(
+            query=f'type:vpc AND tags:{name} AND region:{region}',
+            fields=['tags', 'region', 'type'],
+            limit=1000).get_result()['items']
+        if not vpcs_filtered_by_tags_and_region:
+            # a vpc could have been removed unkownlingly to skypilot, such as
+            # via `sky autostop --down`, or simply manually (e.g. via console).
+            logger.warning('No vpc exists in '
+                           f'{region} '
+                           f'with tag: {name}')
+            return status_map['cluster_deleted']
+        vpc_id = vpcs_filtered_by_tags_and_region[0]['crn'].rsplit(':', 1)[-1]
+        instances = client.list_instances(
+            vpc_id=vpc_id).get_result()['instances']
+
+        return [status_map[instance['status']] for instance in instances]
 
 
 def get_cred_file_field(field, default_val=None) -> str:
     """returns a the value of a field from the user's
      credentials file if exists, else default_val"""
-    base_config = _read_credential_file()
+    base_config = ibm.read_credential_file()
     if not base_config:
         raise FileNotFoundError('Missing '
                                 f'credential file at {CREDENTIAL_FILE}')

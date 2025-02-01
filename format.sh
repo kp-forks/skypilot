@@ -47,17 +47,21 @@ YAPF_FLAGS=(
 )
 
 YAPF_EXCLUDES=(
-    '--exclude' 'sky/skylet/providers/aws/**'
-    '--exclude' 'sky/skylet/providers/gcp/**'
-    '--exclude' 'sky/skylet/providers/azure/**'
+    '--exclude' 'build/**'
     '--exclude' 'sky/skylet/providers/ibm/**'
 )
 
+ISORT_YAPF_EXCLUDES=(
+    '--sg' 'build/**'
+    '--sg' 'sky/skylet/providers/ibm/**'
+)
+
 BLACK_INCLUDES=(
-    'sky/skylet/providers/aws'
-    'sky/skylet/providers/gcp'
-    'sky/skylet/providers/azure'
     'sky/skylet/providers/ibm'
+)
+
+PYLINT_FLAGS=(
+    '--load-plugins'  'pylint_quotes'
 )
 
 # Format specified files
@@ -77,16 +81,20 @@ format_changed() {
     MERGEBASE="$(git merge-base origin/master HEAD)"
 
     if ! git diff --diff-filter=ACM --quiet --exit-code "$MERGEBASE" -- '*.py' '*.pyi' &>/dev/null; then
-        git diff --name-only --diff-filter=ACM "$MERGEBASE" -- '*.py' '*.pyi' | xargs -P 5 \
-             yapf --in-place "${YAPF_EXCLUDES[@]}" "${YAPF_FLAGS[@]}"
+        git diff --name-only --diff-filter=ACM "$MERGEBASE" -- '*.py' '*.pyi' | \
+            tr '\n' '\0' | xargs -P 5 -0 \
+            yapf --in-place "${YAPF_EXCLUDES[@]}" "${YAPF_FLAGS[@]}"
     fi
 
 }
 
 # Format all files
 format_all() {
-    yapf --in-place "${YAPF_FLAGS[@]}" "${YAPF_EXCLUDES[@]}" sky tests examples
+    yapf --in-place "${YAPF_FLAGS[@]}" "${YAPF_EXCLUDES[@]}" sky tests examples llm
 }
+
+echo 'SkyPilot Black:'
+black "${BLACK_INCLUDES[@]}"
 
 ## This flag formats individual files. --files *must* be the first command line
 ## arg to use this option.
@@ -101,8 +109,12 @@ else
    format_changed
 fi
 echo 'SkyPilot yapf: Done'
-echo 'SkyPilot Black:'
-black "${BLACK_INCLUDES[@]}"
+
+echo 'SkyPilot isort:'
+isort sky tests examples llm docs "${ISORT_YAPF_EXCLUDES[@]}"
+
+isort --profile black -l 88 -m 3 "sky/skylet/providers/ibm"
+
 
 # Run mypy
 # TODO(zhwu): When more of the codebase is typed properly, the mypy flags
@@ -112,7 +124,21 @@ mypy $(cat tests/mypy_files.txt)
 
 # Run Pylint
 echo 'Sky Pylint:'
-pylint --load-plugins pylint_quotes sky
+if [[ "$1" == '--files' ]]; then
+    # If --files is passed, filter to files within sky/ and pass to pylint.
+    pylint "${PYLINT_FLAGS[@]}" "${@:2}"
+elif [[ "$1" == '--all' ]]; then
+    # Pylint entire sky directory.
+    pylint "${PYLINT_FLAGS[@]}" sky
+else
+    # Pylint only files in sky/ that have changed in last commit.
+    changed_files=$(git diff --name-only --diff-filter=ACM "$MERGEBASE" -- 'sky/*.py' 'sky/*.pyi')
+    if [[ -n "$changed_files" ]]; then
+        echo "$changed_files" | tr '\n' '\0' | xargs -0 pylint "${PYLINT_FLAGS[@]}"
+    else
+        echo 'Pylint skipped: no files changed in sky/.'
+    fi
+fi
 
 if ! git diff --quiet &>/dev/null; then
     echo 'Reformatted files. Please review and stage the changes.'

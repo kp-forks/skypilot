@@ -1,21 +1,28 @@
 """skylet events"""
-import getpass
 import math
 import os
 import re
 import subprocess
-import sys
 import time
 import traceback
 
 import psutil
 import yaml
 
+from sky import clouds
 from sky import sky_logging
-from sky.backends import backend_utils, cloud_vm_ray_backend
-from sky.skylet import autostop_lib, job_lib
-from sky.spot import spot_utils
+from sky.backends import cloud_vm_ray_backend
+from sky.clouds import cloud_registry
+from sky.jobs import scheduler as managed_job_scheduler
+from sky.jobs import state as managed_job_state
+from sky.jobs import utils as managed_job_utils
+from sky.serve import serve_utils
+from sky.skylet import autostop_lib
+from sky.skylet import constants
+from sky.skylet import job_lib
+from sky.utils import cluster_yaml_utils
 from sky.utils import common_utils
+from sky.utils import ux_utils
 
 # Seconds of sleep between the processing of skylet events.
 EVENT_CHECKING_INTERVAL_SECONDS = 20
@@ -47,34 +54,40 @@ class SkyletEvent:
             except Exception as e:  # pylint: disable=broad-except
                 # Keep the skylet running even if an event fails.
                 logger.error(f'{self.__class__.__name__} error: {e}')
-                logger.error(traceback.format_exc())
+                with ux_utils.enable_traceback():
+                    logger.error(traceback.format_exc())
 
     def _run(self):
         raise NotImplementedError
 
 
-class JobUpdateEvent(SkyletEvent):
-    """Skylet event for updating job status."""
-    EVENT_INTERVAL_SECONDS = 300
-
-    # Only update status of the jobs after this many seconds of job submission,
-    # to avoid race condition with `ray job` to make sure it job has been
-    # correctly updated.
-    # TODO(zhwu): This number should be tuned based on heuristics.
-    _SUBMITTED_GAP_SECONDS = 60
-
-    def _run(self):
-        job_owner = getpass.getuser()
-        job_lib.update_status(job_owner,
-                              submitted_gap_sec=self._SUBMITTED_GAP_SECONDS)
-
-
-class SpotJobUpdateEvent(SkyletEvent):
-    """Skylet event for updating spot job status."""
+class JobSchedulerEvent(SkyletEvent):
+    """Skylet event for scheduling jobs"""
     EVENT_INTERVAL_SECONDS = 300
 
     def _run(self):
-        spot_utils.update_spot_job_status()
+        job_lib.scheduler.schedule_step(force_update_jobs=True)
+
+
+class ManagedJobEvent(SkyletEvent):
+    """Skylet event for updating and scheduling managed jobs."""
+    EVENT_INTERVAL_SECONDS = 300
+
+    def _run(self):
+        managed_job_utils.update_managed_jobs_statuses()
+        managed_job_scheduler.maybe_schedule_next_jobs()
+
+
+class ServiceUpdateEvent(SkyletEvent):
+    """Skylet event for updating sky serve service status.
+
+    This is needed to handle the case that controller process is somehow
+    terminated and the service status is not updated.
+    """
+    EVENT_INTERVAL_SECONDS = 300
+
+    def _run(self):
+        serve_utils.update_service_status()
 
 
 class AutostopEvent(SkyletEvent):
@@ -96,8 +109,6 @@ class AutostopEvent(SkyletEvent):
     def __init__(self):
         super().__init__()
         autostop_lib.set_last_active_time_to_now()
-        self._ray_yaml_path = os.path.abspath(
-            os.path.expanduser(backend_utils.SKY_RAY_YAML_REMOTE_PATH))
 
     def _run(self):
         autostop_config = autostop_lib.get_autostop_config()
@@ -108,7 +119,8 @@ class AutostopEvent(SkyletEvent):
             logger.debug('autostop_config not set. Skipped.')
             return
 
-        if job_lib.is_cluster_idle():
+        if (job_lib.is_cluster_idle() and
+                not managed_job_state.get_num_alive_jobs()):
             idle_minutes = (time.time() -
                             autostop_lib.get_last_active_time()) // 60
             logger.debug(
@@ -131,13 +143,28 @@ class AutostopEvent(SkyletEvent):
                 cloud_vm_ray_backend.CloudVmRayBackend.NAME):
             autostop_lib.set_autostopping_started()
 
-            config = common_utils.read_yaml(self._ray_yaml_path)
+            config_path = os.path.abspath(
+                os.path.expanduser(
+                    cluster_yaml_utils.SKY_CLUSTER_YAML_REMOTE_PATH))
+            config = common_utils.read_yaml(config_path)
+            provider_name = cluster_yaml_utils.get_provider_name(config)
+            cloud = cloud_registry.CLOUD_REGISTRY.from_str(provider_name)
+            assert cloud is not None, f'Unknown cloud: {provider_name}'
+
+            if (cloud.PROVISIONER_VERSION >= clouds.ProvisionerVersion.
+                    RAY_PROVISIONER_SKYPILOT_TERMINATOR):
+                logger.info('Using new provisioner to stop the cluster.')
+                self._stop_cluster_with_new_provisioner(autostop_config, config,
+                                                        provider_name)
+                return
+            logger.info('Not using new provisioner to stop the cluster. '
+                        f'Cloud of this cluster: {provider_name}')
+
             is_cluster_multinode = config['max_workers'] > 0
 
             # Even for !is_cluster_multinode, we want to call this to replace
             # cache_stopped_nodes.
-            self._replace_yaml_for_stopping(self._ray_yaml_path,
-                                            autostop_config.down)
+            self._replace_yaml_for_stopping(config_path, autostop_config.down)
 
             # Use environment variables to disable the ray usage collection (to
             # avoid overheads and potential issues with the usage) as sdk does
@@ -164,37 +191,81 @@ class AutostopEvent(SkyletEvent):
                 logger.info('Running ray up.')
                 script = (cloud_vm_ray_backend.
                           write_ray_up_script_with_patched_launch_hash_fn(
-                              self._ray_yaml_path,
+                              config_path,
                               ray_up_kwargs={'restart_only': True}))
                 # Passing env inherited from os.environ is technically not
                 # needed, because we call `python <script>` rather than `ray
                 # <cmd>`. We just need the {RAY_USAGE_STATS_ENABLED: 0} part.
-                subprocess.run([sys.executable, script], check=True, env=env)
+                subprocess.run(f'{constants.SKY_PYTHON_CMD} {script}',
+                               check=True,
+                               shell=True,
+                               env=env)
 
                 logger.info('Running ray down.')
                 # Stop the workers first to avoid orphan workers.
                 subprocess.run(
-                    [
-                        'ray', 'down', '-y', '--workers-only',
-                        self._ray_yaml_path
-                    ],
+                    f'{constants.SKY_RAY_CMD} down -y --workers-only '
+                    f'{config_path}',
                     check=True,
+                    shell=True,
                     # We pass env inherited from os.environ due to calling `ray
                     # <cmd>`.
                     env=env)
 
+            # Stop the ray autoscaler to avoid scaling up, during
+            # stopping/terminating of the cluster. We do not rely `ray down`
+            # below for stopping ray cluster, as it will not use the correct
+            # ray path.
+            logger.info('Stopping the ray cluster.')
+            subprocess.run(f'{constants.SKY_RAY_CMD} stop',
+                           shell=True,
+                           check=True)
+
             logger.info('Running final ray down.')
             subprocess.run(
-                ['ray', 'down', '-y', self._ray_yaml_path],
+                f'{constants.SKY_RAY_CMD} down -y {config_path}',
                 check=True,
+                shell=True,
                 # We pass env inherited from os.environ due to calling `ray
                 # <cmd>`.
                 env=env)
         else:
             raise NotImplementedError
 
+    def _stop_cluster_with_new_provisioner(self, autostop_config,
+                                           cluster_config, provider_name):
+        # pylint: disable=import-outside-toplevel
+        from sky import provision as provision_lib
+        autostop_lib.set_autostopping_started()
+
+        cluster_name_on_cloud = cluster_config['cluster_name']
+        is_cluster_multinode = cluster_config['max_workers'] > 0
+
+        os.environ.pop('AWS_ACCESS_KEY_ID', None)
+        os.environ.pop('AWS_SECRET_ACCESS_KEY', None)
+
+        # Stop the ray autoscaler to avoid scaling up, during
+        # stopping/terminating of the cluster.
+        logger.info('Stopping the ray cluster.')
+        subprocess.run(f'{constants.SKY_RAY_CMD} stop', shell=True, check=True)
+
+        operation_fn = provision_lib.stop_instances
+        if autostop_config.down:
+            operation_fn = provision_lib.terminate_instances
+
+        if is_cluster_multinode:
+            logger.info('Terminating worker nodes first.')
+            operation_fn(provider_name=provider_name,
+                         cluster_name_on_cloud=cluster_name_on_cloud,
+                         provider_config=cluster_config['provider'],
+                         worker_only=True)
+        logger.info('Terminating head node.')
+        operation_fn(provider_name=provider_name,
+                     cluster_name_on_cloud=cluster_name_on_cloud,
+                     provider_config=cluster_config['provider'])
+
     def _replace_yaml_for_stopping(self, yaml_path: str, down: bool):
-        with open(yaml_path, 'r') as f:
+        with open(yaml_path, 'r', encoding='utf-8') as f:
             yaml_str = f.read()
         yaml_str = self._UPSCALING_PATTERN.sub(r'upscaling_speed: 0', yaml_str)
         if down:

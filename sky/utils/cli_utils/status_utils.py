@@ -1,41 +1,27 @@
 """Utilities for sky status."""
+import typing
 from typing import Any, Callable, Dict, List, Optional
+
 import click
 import colorama
 
 from sky import backends
-from sky import global_user_state
-from sky import spot
-from sky.backends import backend_utils
+from sky import status_lib
+from sky.skylet import constants
 from sky.utils import common_utils
 from sky.utils import log_utils
+from sky.utils import resources_utils
 
-_COMMAND_TRUNC_LENGTH = 25
+if typing.TYPE_CHECKING:
+    from sky.provision.kubernetes import utils as kubernetes_utils
+
+COMMAND_TRUNC_LENGTH = 25
 NUM_COST_REPORT_LINES = 5
 
 # A record in global_user_state's 'clusters' table.
 _ClusterRecord = Dict[str, Any]
 # A record returned by core.cost_report(); see its docstr for all fields.
 _ClusterCostReportRecord = Dict[str, Any]
-
-
-def _truncate_long_string(s: str, max_length: int = 35) -> str:
-    if len(s) <= max_length:
-        return s
-    splits = s.split(' ')
-    if len(splits[0]) > max_length:
-        return splits[0][:max_length] + '...'  # Use '…'?
-    # Truncate on word boundary.
-    i = 0
-    total = 0
-    for i, part in enumerate(splits):
-        total += len(part)
-        if total >= max_length:
-            break
-    prefix = ' '.join(splits[:i])
-    if len(prefix) < max_length:
-        prefix += s[len(prefix):max_length]
-    return prefix + '...'
 
 
 class StatusColumn:
@@ -54,7 +40,7 @@ class StatusColumn:
     def calc(self, record):
         val = self.calc_func(record)
         if self.trunc_length != 0:
-            val = _truncate_long_string(str(val), self.trunc_length)
+            val = common_utils.truncate_long_string(str(val), self.trunc_length)
         return val
 
 
@@ -78,9 +64,10 @@ def show_status_table(cluster_records: List[_ClusterRecord],
         StatusColumn('ZONE', _get_zone, show_by_default=False),
         StatusColumn('STATUS', _get_status_colored),
         StatusColumn('AUTOSTOP', _get_autostop),
+        StatusColumn('HEAD_IP', _get_head_ip, show_by_default=False),
         StatusColumn('COMMAND',
                      _get_command,
-                     trunc_length=_COMMAND_TRUNC_LENGTH if not show_all else 0),
+                     trunc_length=COMMAND_TRUNC_LENGTH if not show_all else 0),
     ]
 
     columns = []
@@ -121,7 +108,7 @@ def get_total_cost_of_displayed_records(
 
 def show_cost_report_table(cluster_records: List[_ClusterCostReportRecord],
                            show_all: bool,
-                           reserved_group_name: Optional[str] = None):
+                           controller_name: Optional[str] = None):
     """Compute cluster table values and display for cost report.
 
     For each cluster, this shows: cluster name, resources, launched time,
@@ -154,7 +141,7 @@ def show_cost_report_table(cluster_records: List[_ClusterCostReportRecord],
         StatusColumn('STATUS',
                      _get_status_for_cost_report,
                      show_by_default=True),
-        StatusColumn('HOURLY_PRICE',
+        StatusColumn('COST/hr',
                      _get_price_for_cost_report,
                      show_by_default=True),
         StatusColumn('COST (est.)',
@@ -184,113 +171,16 @@ def show_cost_report_table(cluster_records: List[_ClusterCostReportRecord],
         cluster_table.add_row(row)
 
     if cluster_records:
-        if reserved_group_name is not None:
-            autostop_minutes = spot.SPOT_CONTROLLER_IDLE_MINUTES_TO_AUTOSTOP
+        if controller_name is not None:
+            autostop_minutes = constants.CONTROLLER_IDLE_MINUTES_TO_AUTOSTOP
             click.echo(f'\n{colorama.Fore.CYAN}{colorama.Style.BRIGHT}'
-                       f'{reserved_group_name}{colorama.Style.RESET_ALL}'
+                       f'{controller_name}{colorama.Style.RESET_ALL}'
                        f'{colorama.Style.DIM} (will be autostopped if idle for '
                        f'{autostop_minutes}min)'
                        f'{colorama.Style.RESET_ALL}')
         else:
             click.echo(f'{colorama.Fore.CYAN}{colorama.Style.BRIGHT}Clusters'
                        f'{colorama.Style.RESET_ALL}')
-        click.echo(cluster_table)
-
-
-def show_local_status_table(local_clusters: List[str]):
-    """Lists all local clusters.
-
-    Lists both uninitialized and initialized local clusters. Uninitialized
-    local clusters are clusters that have their cluster configs in
-    ~/.sky/local. Sky does not know if the cluster is valid yet and does not
-    know what resources the cluster has. Hence, this func will return blank
-    values for such clusters. Initialized local clusters are created using
-    `sky launch`. Sky understands what types of resources are on the nodes and
-    has ran at least one job on the cluster.
-    """
-    clusters_status = backend_utils.get_clusters(
-        include_reserved=False,
-        refresh=False,
-        cloud_filter=backend_utils.CloudFilter.LOCAL)
-    columns = [
-        'NAME',
-        'USER',
-        'HEAD_IP',
-        'RESOURCES',
-        'COMMAND',
-    ]
-
-    cluster_table = log_utils.create_table(columns)
-    names = []
-    # Handling for initialized clusters.
-    for cluster_status in clusters_status:
-        handle = cluster_status['handle']
-        config_path = handle.cluster_yaml
-        config = common_utils.read_yaml(config_path)
-        username = config['auth']['ssh_user']
-
-        if not isinstance(handle, backends.CloudVmRayResourceHandle):
-            raise ValueError(f'Unknown handle type {type(handle)} encountered.')
-
-        if (handle.launched_nodes is not None and
-                handle.launched_resources is not None):
-            if hasattr(handle,
-                       'local_handle') and handle.local_handle is not None:
-                local_cluster_resources = [
-                    r.accelerators
-                    for r in handle.local_handle['cluster_resources']
-                ]
-                # Replace with (no GPUs)
-                local_cluster_resources = [
-                    r if r is not None else '(no GPUs)'
-                    for r in local_cluster_resources
-                ]
-                head_ip = handle.local_handle['ips'][0]
-            else:
-                local_cluster_resources = []
-                head_ip = ''
-            for idx, resource in enumerate(local_cluster_resources):
-                if not bool(resource):
-                    local_cluster_resources[idx] = None
-            resources_str = '[{}]'.format(', '.join(
-                map(str, local_cluster_resources)))
-        command_str = cluster_status['last_use']
-        cluster_name = handle.cluster_name
-        row = [
-            # NAME
-            cluster_name,
-            # USER
-            username,
-            # HEAD_IP
-            head_ip,
-            # RESOURCES
-            resources_str,
-            # COMMAND
-            _truncate_long_string(command_str, _COMMAND_TRUNC_LENGTH),
-        ]
-        names.append(cluster_name)
-        cluster_table.add_row(row)
-
-    # Handling for uninitialized clusters.
-    for clus in local_clusters:
-        if clus not in names:
-            row = [
-                # NAME
-                clus,
-                # USER
-                '-',
-                # HEAD_IP
-                '-',
-                # RESOURCES
-                '-',
-                # COMMAND
-                '-',
-            ]
-            cluster_table.add_row(row)
-
-    if clusters_status or local_clusters:
-        click.echo(f'\n{colorama.Fore.CYAN}{colorama.Style.BRIGHT}Local '
-                   f'clusters:{colorama.Style.RESET_ALL}')
         click.echo(cluster_table)
 
 
@@ -307,8 +197,7 @@ _get_duration = (lambda cluster_record: log_utils.readable_time_duration(
     0, cluster_record['duration'], absolute=True))
 
 
-def _get_status(
-        cluster_record: _ClusterRecord) -> global_user_state.ClusterStatus:
+def _get_status(cluster_record: _ClusterRecord) -> status_lib.ClusterStatus:
     return cluster_record['status']
 
 
@@ -318,15 +207,10 @@ def _get_status_colored(cluster_record: _ClusterRecord) -> str:
 
 def _get_resources(cluster_record: _ClusterRecord) -> str:
     handle = cluster_record['handle']
-    resources_str = '<initializing>'
     if isinstance(handle, backends.LocalDockerResourceHandle):
         resources_str = 'docker'
     elif isinstance(handle, backends.CloudVmRayResourceHandle):
-        if (handle.launched_nodes is not None and
-                handle.launched_resources is not None):
-            launched_resource_str = str(handle.launched_resources)
-            resources_str = (f'{handle.launched_nodes}x '
-                             f'{launched_resource_str}')
+        resources_str = resources_utils.get_readable_resources_repr(handle)
     else:
         raise ValueError(f'Unknown handle type {type(handle)} encountered.')
     return resources_str
@@ -341,23 +225,32 @@ def _get_zone(cluster_record: _ClusterRecord) -> str:
 
 def _get_autostop(cluster_record: _ClusterRecord) -> str:
     autostop_str = ''
-    separtion = ''
+    separation = ''
     if cluster_record['autostop'] >= 0:
         # TODO(zhwu): check the status of the autostop cluster.
         autostop_str = str(cluster_record['autostop']) + 'm'
-        separtion = ' '
+        separation = ' '
 
     if cluster_record['to_down']:
-        autostop_str += f'{separtion}(down)'
+        autostop_str += f'{separation}(down)'
     if autostop_str == '':
         autostop_str = '-'
     return autostop_str
 
 
+def _get_head_ip(cluster_record: _ClusterRecord) -> str:
+    handle = cluster_record['handle']
+    if not isinstance(handle, backends.CloudVmRayResourceHandle):
+        return '-'
+    if handle.head_ip is None:
+        return '-'
+    return handle.head_ip
+
+
 def _is_pending_autostop(cluster_record: _ClusterRecord) -> bool:
     # autostop < 0 means nothing scheduled.
     return cluster_record['autostop'] >= 0 and _get_status(
-        cluster_record) != global_user_state.ClusterStatus.STOPPED
+        cluster_record) != status_lib.ClusterStatus.STOPPED
 
 
 # ---- 'sky cost-report' helper functions below ----
@@ -397,7 +290,7 @@ def _get_price_for_cost_report(
     launched_resources = cluster_cost_report_record['resources']
 
     hourly_cost = (launched_resources.get_cost(3600) * launched_nodes)
-    price_str = f'$ {hourly_cost:.3f}'
+    price_str = f'$ {hourly_cost:.2f}'
     return price_str
 
 
@@ -408,4 +301,46 @@ def _get_estimated_cost_for_cost_report(
     if not cost:
         return '-'
 
-    return f'${cost:.3f}'
+    return f'$ {cost:.2f}'
+
+
+def show_kubernetes_cluster_status_table(
+        clusters: List['kubernetes_utils.KubernetesSkyPilotClusterInfo'],
+        show_all: bool) -> None:
+    """Compute cluster table values and display for Kubernetes clusters."""
+    status_columns = [
+        StatusColumn('USER', lambda c: c.user),
+        StatusColumn('NAME', lambda c: c.cluster_name),
+        StatusColumn('LAUNCHED',
+                     lambda c: log_utils.readable_time_duration(c.launched_at)),
+        StatusColumn('RESOURCES',
+                     lambda c: c.resources_str,
+                     trunc_length=70 if not show_all else 0),
+        StatusColumn('STATUS', lambda c: c.status.colored_str()),
+        # TODO(romilb): We should consider adding POD_NAME field here when --all
+        #  is passed to help users fetch pod name programmatically.
+    ]
+
+    columns = [
+        col.name for col in status_columns if col.show_by_default or show_all
+    ]
+    cluster_table = log_utils.create_table(columns)
+
+    # Sort table by user, then by cluster name
+    sorted_clusters = sorted(clusters, key=lambda c: (c.user, c.cluster_name))
+
+    for cluster in sorted_clusters:
+        row = []
+        for status_column in status_columns:
+            if status_column.show_by_default or show_all:
+                row.append(status_column.calc(cluster))
+        cluster_table.add_row(row)
+
+    if clusters:
+        click.echo(f'{colorama.Fore.CYAN}{colorama.Style.BRIGHT}'
+                   f'SkyPilot clusters'
+                   f'{colorama.Style.RESET_ALL}')
+        click.echo(cluster_table)
+    else:
+        click.echo('No SkyPilot resources found in the '
+                   'active Kubernetes context.')

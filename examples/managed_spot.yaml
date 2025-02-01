@@ -1,5 +1,8 @@
 name: minimal
 
+resources:
+  use_spot: true
+
 setup: |
   echo "running setup"
   pip install tqdm
@@ -10,7 +13,7 @@ run: |
   import time
   import tqdm
 
-  for i in tqdm.trange(120):
+  for i in tqdm.trange(240):
     time.sleep(1)
   
   EOF

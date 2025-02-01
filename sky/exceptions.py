@@ -1,15 +1,24 @@
 """Exceptions."""
 import enum
 import typing
-from typing import List, Optional
+from typing import List, Optional, Sequence
+
+from sky.utils import env_options
 
 if typing.TYPE_CHECKING:
-    from sky import global_user_state
+    from sky import status_lib
+    from sky.backends import backend
 
 # Return code for keyboard interruption and SIGTSTP
 KEYBOARD_INTERRUPT_CODE = 130
 SIGTSTP_CODE = 146
 RSYNC_FILE_NOT_FOUND_CODE = 23
+# Arbitrarily chosen value. Used in SkyPilot's storage mounting scripts
+MOUNT_PATH_NON_EMPTY_CODE = 42
+# Arbitrarily chosen value. Used to provision Kubernetes instance in Skypilot
+INSUFFICIENT_PRIVILEGES_CODE = 52
+# Return code when git command is ran in a dir that is not git repo
+GIT_FATAL_EXIT_CODE = 128
 
 
 class ResourcesUnavailableError(Exception):
@@ -39,28 +48,34 @@ class ResourcesUnavailableError(Exception):
         return self
 
 
+class InvalidCloudConfigs(Exception):
+    """Raised when invalid configurations are provided for a given cloud."""
+    pass
+
+
 class ProvisionPrechecksError(Exception):
-    """Raised when a spot job fails prechecks before provision.
+    """Raised when a managed job fails prechecks before provision.
+
     Developer note: For now this should only be used by managed
-    spot code path (technically, this can/should be raised by the
+    jobs code path (technically, this can/should be raised by the
     lower-level sky.launch()). Please refer to the docstring of
-    `spot.recovery_strategy._launch` for more details about when
+    `jobs.recovery_strategy._launch` for more details about when
     the error will be raised.
 
     Args:
-        reasons: (List[Exception]) The reasons why the prechecks failed.
+        reasons: (Sequence[Exception]) The reasons why the prechecks failed.
     """
 
-    def __init__(self, reasons: List[Exception]) -> None:
+    def __init__(self, reasons: Sequence[Exception]) -> None:
         super().__init__()
-        self.reasons = list(reasons)
+        self.reasons = reasons
 
 
-class SpotJobReachedMaxRetriesError(Exception):
-    """Raised when a spot job fails to be launched after maximum retries.
+class ManagedJobReachedMaxRetriesError(Exception):
+    """Raised when a managed job fails to be launched after maximum retries.
 
-    Developer note: For now this should only be used by managed spot code
-    path. Please refer to the docstring of `spot.recovery_strategy._launch`
+    Developer note: For now this should only be used by managed jobs code
+    path. Please refer to the docstring of `jobs.recovery_strategy._launch`
     for more details about when the error will be raised.
     """
     pass
@@ -75,33 +90,52 @@ class CommandError(Exception):
     """Raised when a command fails.
 
     Args:
-    returncode: The returncode of the command.
-    command: The command that was run.
-    error_message: The error message to print.
+        returncode: The returncode of the command.
+        command: The command that was run.
+        error_message: The error message to print.
+        detailed_reason: The stderr of the command.
     """
 
-    def __init__(self, returncode: int, command: str, error_msg: str) -> None:
+    def __init__(self, returncode: int, command: str, error_msg: str,
+                 detailed_reason: Optional[str]) -> None:
         self.returncode = returncode
         self.command = command
         self.error_msg = error_msg
-        message = (f'Command {command} failed with return code {returncode}.'
-                   f'\n{error_msg}')
+        self.detailed_reason = detailed_reason
+
+        if not command:
+            message = error_msg
+        else:
+            if (len(command) > 100 and
+                    not env_options.Options.SHOW_DEBUG_INFO.get()):
+                # Chunck the command to avoid overflow.
+                command = command[:100] + '...'
+            message = (f'Command {command} failed with return code '
+                       f'{returncode}.\n{error_msg}')
         super().__init__(message)
 
 
 class ClusterNotUpError(Exception):
     """Raised when a cluster is not up."""
 
-    def __init__(
-            self, message: str,
-            cluster_status: Optional['global_user_state.ClusterStatus']
-    ) -> None:
+    def __init__(self,
+                 message: str,
+                 cluster_status: Optional['status_lib.ClusterStatus'],
+                 handle: Optional['backend.ResourceHandle'] = None) -> None:
         super().__init__(message)
         self.cluster_status = cluster_status
+        self.handle = handle
 
 
 class ClusterSetUpError(Exception):
     """Raised when a cluster has setup error."""
+    pass
+
+
+class ClusterDoesNotExist(ValueError):
+    """Raise when trying to operate on a cluster that does not exist."""
+    # This extends ValueError for compatibility reasons - we used to throw
+    # ValueError instead of this.
     pass
 
 
@@ -164,8 +198,20 @@ class StorageModeError(StorageSpecError):
     pass
 
 
-class FetchIPError(Exception):
-    """Raised when fetching the IP fails."""
+class StorageExternalDeletionError(StorageBucketGetError):
+    # Error raised when the bucket is attempted to be fetched while it has been
+    # deleted externally.
+    pass
+
+
+class NonExistentStorageAccountError(StorageExternalDeletionError):
+    # Error raise when storage account provided through config.yaml or read
+    # from store handle(local db) does not exist.
+    pass
+
+
+class FetchClusterInfoError(Exception):
+    """Raised when fetching the cluster info fails."""
 
     class Reason(enum.Enum):
         HEAD = 'HEAD'
@@ -186,8 +232,8 @@ class ClusterStatusFetchingError(Exception):
     pass
 
 
-class SpotUserCancelledError(Exception):
-    """Raised when a spot user cancels the job."""
+class ManagedJobUserCancelledError(Exception):
+    """Raised when a user cancels a managed job."""
     pass
 
 
@@ -208,4 +254,55 @@ class ClusterOwnerIdentityMismatchError(Exception):
 
 class NoCloudAccessError(Exception):
     """Raised when all clouds are disabled."""
+    pass
+
+
+class AWSAzFetchingError(Exception):
+    """Raised when fetching the AWS availability zone fails."""
+
+    class Reason(enum.Enum):
+        """Reason for fetching availability zone failure."""
+
+        AUTH_FAILURE = 'AUTH_FAILURE'
+        AZ_PERMISSION_DENIED = 'AZ_PERMISSION_DENIED'
+
+        @property
+        def message(self) -> str:
+            if self == self.AUTH_FAILURE:
+                return ('Failed to access AWS services. Please check your AWS '
+                        'credentials.')
+            elif self == self.AZ_PERMISSION_DENIED:
+                return (
+                    'Failed to retrieve availability zones. '
+                    'Please ensure that the `ec2:DescribeAvailabilityZones` '
+                    'action is enabled for your AWS account in IAM. '
+                    'Ref: https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeAvailabilityZones.html.'  # pylint: disable=line-too-long
+                )
+            else:
+                raise ValueError(f'Unknown reason {self}')
+
+    def __init__(self, region: str,
+                 reason: 'AWSAzFetchingError.Reason') -> None:
+        self.region = region
+        self.reason = reason
+
+        super().__init__(reason.message)
+
+
+class ServeUserTerminatedError(Exception):
+    """Raised by serve controller when a user tear down the service."""
+    pass
+
+
+class PortDoesNotExistError(Exception):
+    """Raised when the port does not exist."""
+
+
+class UserRequestRejectedByPolicy(Exception):
+    """Raised when a user request is rejected by an admin policy."""
+    pass
+
+
+class NoClusterLaunchedError(Exception):
+    """No cluster launched, so cleanup can be skipped during failover."""
     pass

@@ -1,15 +1,16 @@
-"""
-IBM Offerings Catalog.
+"""IBM Offerings Catalog.
 
 This module loads the service catalog file and can be used to query
 instance types and pricing information for IBM.
 """
 
+from typing import Dict, List, Optional, Tuple, Union
+
 from sky import sky_logging
+from sky.adaptors import ibm
 from sky.clouds import cloud
 from sky.clouds.service_catalog import common
-from sky.adaptors import ibm
-from typing import Dict, List, Optional, Tuple
+from sky.utils import resources_utils
 
 logger = sky_logging.init_logger(__name__)
 
@@ -28,14 +29,6 @@ def validate_region_zone(region: Optional[str], zone: Optional[str]):
     return common.validate_region_zone_impl('IBM', _df, region, zone)
 
 
-def accelerator_in_region_or_zone(acc_name: str,
-                                  acc_count: int,
-                                  region: Optional[str] = None,
-                                  zone: Optional[str] = None) -> bool:
-    return common.accelerator_in_region_or_zone_impl(_df, acc_name, acc_count,
-                                                     region, zone)
-
-
 def get_hourly_cost(instance_type: str,
                     use_spot: bool = False,
                     region: Optional[str] = None,
@@ -50,7 +43,7 @@ def get_vcpus_mem_from_instance_type(
 
 
 def get_accelerators_from_instance_type(
-        instance_type: str) -> Optional[Dict[str, int]]:
+        instance_type: str) -> Optional[Dict[str, Union[int, float]]]:
     return common.get_accelerators_from_instance_type_impl(_df, instance_type)
 
 
@@ -63,7 +56,8 @@ def get_instance_type_for_accelerator(
     region: Optional[str] = None,
     zone: Optional[str] = None,
 ) -> Tuple[Optional[List[str]], List[str]]:
-    """
+    """Filter the instance types based on resource requirements.
+
     Returns a list of instance types satisfying the required count of
     accelerators with sorted prices and a list of candidates with fuzzy search.
     """
@@ -87,16 +81,21 @@ def list_accelerators(
         gpus_only: bool,
         name_filter: Optional[str],
         region_filter: Optional[str],
-        case_sensitive: bool = True
-) -> Dict[str, List[common.InstanceTypeInfo]]:
+        quantity_filter: Optional[int],
+        case_sensitive: bool = True,
+        all_regions: bool = False,
+        require_price: bool = True) -> Dict[str, List[common.InstanceTypeInfo]]:
     """Returns all instance types in IBM offering accelerators."""
+    del require_price  # Unused.
     return common.list_accelerators_impl('IBM', _df, gpus_only, name_filter,
-                                         region_filter, case_sensitive)
+                                         region_filter, quantity_filter,
+                                         case_sensitive, all_regions)
 
 
-def get_default_instance_type(cpus: Optional[str] = None,
-                              memory: Optional[str] = None,
-                              disk_tier: Optional[str] = None) -> Optional[str]:
+def get_default_instance_type(
+        cpus: Optional[str] = None,
+        memory: Optional[str] = None,
+        disk_tier: Optional[resources_utils.DiskTier] = None) -> Optional[str]:
     del disk_tier  # unused
     if cpus is None and memory is None:
         cpus = f'{_DEFAULT_NUM_VCPUS}+'
